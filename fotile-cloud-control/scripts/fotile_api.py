@@ -3,6 +3,8 @@
 FOTILE Cloud Control - Python client and CLI.
 
 A small, dependency-light client for the FOTILE open cloud device channel.
+It uses `requests` when installed and falls back to the standard library
+otherwise, so no third-party package is strictly required.
 It supports the three operations an AI agent needs:
 
   * list_devices()   -> DeviceDiscovery
@@ -60,13 +62,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import ssl
 import stat
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+# `requests` is optional. Some agent runtimes reset their Python environment
+# between sessions and lose installed packages; falling back to the standard
+# library keeps the skill usable with zero third-party dependencies.
+try:
+    import requests
+except ImportError:  # pragma: no cover - depends on the host environment
+    requests = None  # type: ignore[assignment]
 
 # API base. Currently pinned to staging for internal testing.
 # Switch DEFAULT_API_BASE to the production host once it is provisioned.
@@ -82,6 +93,18 @@ DEFAULT_TIMEOUT = 15
 # Retries on rate limiting only (HTTP 429 / business code 42901).
 MAX_RETRIES = 2
 
+# DeviceDiscovery caps the implicit first page at 50 devices. Sending explicit
+# page/pageSize makes the server also return payload.total / payload.hasMore.
+# One large page is preferred over iterating small pages: the server's paged
+# SQL has no ORDER BY, so page boundaries are not stable and paging in small
+# steps can duplicate or drop devices. Iterating is only a fallback for the
+# (currently hypothetical) case of more devices than one large page holds.
+DISCOVERY_PAGE_SIZE = 1000
+DISCOVERY_MAX_PAGES = 20
+# DeviceSnapshot accepts many ids, but keep each request bounded for accounts
+# with hundreds of devices (and to stay under per-call rate limits).
+SNAPSHOT_BATCH_SIZE = 20
+
 # Cloud-to-cloud namespaces.
 NS_DISCOVERY = "DeviceDiscovery"
 NS_SNAPSHOT = "DeviceSnapshot"
@@ -94,6 +117,47 @@ KEY_FILE_USER = os.path.join("~", ".fotile", "api_key")
 
 # Prefix of every personal key. Used for cheap validation before we store one.
 KEY_PREFIX = "ft-cn-"
+
+# Network exceptions worth retrying. Built at import time because their type
+# set depends on whether requests is installed.
+_NETWORK_ERRORS: Tuple[type, ...] = (urllib.error.URLError, OSError)
+if requests is not None:
+    _NETWORK_ERRORS = (requests.RequestException,) + _NETWORK_ERRORS
+
+
+class _Response:
+    """Tiny response shim so the rest of the client is transport-agnostic."""
+
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.text = text
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+def _http_post(url: str, headers: Dict[str, str], body: Dict[str, Any],
+               timeout: int) -> _Response:
+    """POST a JSON body, using requests when present and urllib otherwise."""
+    raw = json.dumps(body).encode("utf-8")
+    if requests is not None:
+        resp = requests.post(url, headers=headers,
+                             data=raw.decode("utf-8"), timeout=timeout)
+        return _Response(resp.status_code, resp.text)
+    req = urllib.request.Request(url, data=raw, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(
+                req, timeout=timeout,
+                context=ssl.create_default_context()) as resp:
+            return _Response(resp.status, resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # HTTPError is itself a file-like response. Keep status and body so the
+        # caller can surface the real business code instead of a bare error.
+        try:
+            text = exc.read().decode("utf-8", "replace")
+        finally:
+            exc.close()
+        return _Response(exc.code, text)
 
 
 def _candidate_key_files() -> List[str]:
@@ -266,7 +330,7 @@ class FotileAPI:
     # Internal helpers
     # ------------------------------------------------------------------ #
     def _post_with_retry(self, url: str, body: Dict[str, Any],
-                         namespace: str) -> "requests.Response":
+                         namespace: str) -> _Response:
         """
         POST with bounded retry on rate limiting (HTTP 429 / code 42901).
 
@@ -276,9 +340,8 @@ class FotileAPI:
         last_exc: Optional[Exception] = None
         for attempt in range(MAX_RETRIES + 1):
             try:
-                resp = requests.post(url, headers=self._headers(),
-                                     data=json.dumps(body), timeout=self.timeout)
-            except requests.RequestException as exc:
+                resp = _http_post(url, self._headers(), body, self.timeout)
+            except _NETWORK_ERRORS as exc:
                 last_exc = exc
                 if attempt < MAX_RETRIES:
                     time.sleep(1.0 * (2 ** attempt))
@@ -298,7 +361,7 @@ class FotileAPI:
             f"Network error calling {namespace}: {last_exc}")
 
     @staticmethod
-    def _is_rate_limited(resp: "requests.Response") -> bool:
+    def _is_rate_limited(resp: _Response) -> bool:
         if resp.status_code == 429:
             return True
         try:
@@ -384,16 +447,109 @@ class FotileAPI:
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
-    def list_devices(self) -> List[Dict[str, Any]]:
-        """Return all devices bound to the current user (DeviceDiscovery)."""
-        payload = self._post(NS_DISCOVERY, {})
-        return payload.get("devices", []) or payload.get("deviceList", []) or []
+    def discover_devices(self) -> Dict[str, Any]:
+        """
+        Return every device reachable by this key, plus pagination metadata.
 
-    def get_status(self, device_id_list: List[str | int]) -> List[Dict[str, Any]]:
-        """Return current snapshots for one or more devices (DeviceSnapshot)."""
-        ids = [str(d) for d in device_id_list]
-        payload = self._post(NS_SNAPSHOT, {"thirdPartyDevIds": ids})
-        return payload.get("devices", []) or payload.get("deviceList", []) or []
+        An account can hold hundreds of devices. The server silently returns
+        only the first 50 unless the client sends page/pageSize, so this method
+        always sends them and honours total/hasMore. Results are de-duplicated
+        by device id because the server's paged SQL has no ORDER BY.
+
+        The C-end AI channel is deliberately NOT filtered by family: every
+        device bound (or shared) to the key's user is in scope.
+
+        :returns: dict with keys
+                  devices    - list of device dicts, de-duplicated by id
+                  total      - server-side count, or None if not reported
+                  complete   - False if anything could not be retrieved
+                  pages      - number of discovery requests actually issued
+                  duplicates - repeated device ids seen across pages
+                  missing    - total - len(devices), when total is known
+                  malformed  - entries dropped because they had no device id
+        """
+        merged: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        total: Optional[int] = None
+        duplicates = 0
+        malformed = 0
+        pages = 0
+        complete = True
+
+        for page in range(1, DISCOVERY_MAX_PAGES + 1):
+            payload = self._post(
+                NS_DISCOVERY,
+                {"page": page, "pageSize": DISCOVERY_PAGE_SIZE})
+            pages += 1
+            server_total = payload.get("total")
+            if isinstance(server_total, int):
+                total = server_total if total is None else max(total, server_total)
+            batch = payload.get("devices") or payload.get("deviceList") or []
+            for device in batch:
+                did = device.get("thirdPartyDevId")
+                if did is None:
+                    malformed += 1
+                    continue
+                key = str(did)
+                if key in merged:
+                    duplicates += 1
+                    continue
+                merged[key] = device
+                order.append(key)
+            if payload.get("hasMore") is not True:
+                break
+        else:
+            # Ran out of page budget while the server still said hasMore.
+            complete = False
+
+        devices = [merged[k] for k in order]
+        missing: Optional[int] = None
+        if total is not None and len(devices) < total:
+            # `total` is a raw DB count. Devices whose product model is broken
+            # are skipped during server-side conversion and never appear in
+            # any page, so paging cannot recover them. Report the gap instead
+            # of silently claiming the list is complete.
+            missing = total - len(devices)
+            complete = False
+
+        return {
+            "devices": devices,
+            "total": total,
+            "complete": complete,
+            "pages": pages,
+            "duplicates": duplicates,
+            "missing": missing,
+            "malformed": malformed,
+        }
+
+    def list_devices(self) -> List[Dict[str, Any]]:
+        """Return ALL devices bound to the current user (DeviceDiscovery)."""
+        return self.discover_devices()["devices"]
+
+    def get_status(self, device_id_list: List[str | int],
+                   batch_size: int = SNAPSHOT_BATCH_SIZE) -> List[Dict[str, Any]]:
+        """
+        Return current snapshots for one or more devices (DeviceSnapshot).
+
+        Large accounts need many ids; split them into bounded batches so a
+        single request never grows unbounded. Duplicate ids are removed while
+        preserving order.
+        """
+        seen = set()
+        ids: List[str] = []
+        for device_id in device_id_list:
+            key = str(device_id)
+            if key not in seen:
+                seen.add(key)
+                ids.append(key)
+        if batch_size < 1:
+            raise FotileAPIError("batch_size must be >= 1")
+        out: List[Dict[str, Any]] = []
+        for i in range(0, len(ids), batch_size):
+            payload = self._post(
+                NS_SNAPSHOT, {"thirdPartyDevIds": ids[i:i + batch_size]})
+            out.extend(payload.get("devices") or payload.get("deviceList") or [])
+        return out
 
     def control(self, prod_id: str, device_id: str | int,
                 sid: str, command: Dict[str, Any],
@@ -505,9 +661,12 @@ def cmd_whoami() -> int:
     }
     try:
         api = FotileAPI(api_key=key)
-        devices = api.list_devices()
+        discovery = api.discover_devices()
+        devices = discovery["devices"]
         info["valid"] = True
         info["deviceCount"] = len(devices)
+        info["deviceTotal"] = discovery["total"]
+        info["deviceListComplete"] = discovery["complete"]
         info["state"] = "READY" if devices else "NO_DEVICE"
     except FotileAPIError as exc:
         info["valid"] = False
@@ -533,7 +692,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                          help="The key. Omit to be prompted (input hidden).")
 
     sub.add_parser("whoami", help="Show which key is in use and whether it works")
-    sub.add_parser("devices", help="List bound devices")
+    p_dev = sub.add_parser("devices", help="List ALL bound devices")
+    p_dev.add_argument(
+        "--meta", action="store_true",
+        help="Also print pagination metadata (total, completeness, pages)")
 
     p_status = sub.add_parser("status", help="Query device status")
     p_status.add_argument("device_ids", nargs="+", help="One or more device ids")
@@ -558,7 +720,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         api = FotileAPI()
         if args.action == "devices":
-            _print(api.list_devices())
+            discovery = api.discover_devices()
+            if args.meta:
+                _print(discovery)
+            else:
+                _print(discovery["devices"])
+                if not discovery["complete"]:
+                    print(
+                        "Warning: device list may be incomplete "
+                        f"(server total={discovery['total']}, "
+                        f"returned={len(discovery['devices'])}, "
+                        f"missing={discovery['missing']}, "
+                        f"pages={discovery['pages']}).",
+                        file=sys.stderr)
         elif args.action == "status":
             _print(api.get_status(args.device_ids))
         elif args.action == "control":

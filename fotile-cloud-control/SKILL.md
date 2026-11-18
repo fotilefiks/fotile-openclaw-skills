@@ -17,6 +17,7 @@ metadata:
     # The key is NOT required at install time: it lives in ~/.fotile/api_key
     # after `login`. Declaring it here would make some harnesses refuse to load
     # the skill, which would hide the very onboarding text new users need.
+    # Optional: fotile_api.py falls back to stdlib urllib if requests is absent.
     requires:
       pip: ["requests>=2.28.0"]
 ---
@@ -247,12 +248,15 @@ Follow these steps in order for every control request:
 
 1. **List devices.** Run `python scripts/fotile_api.py devices` (or call
    `FotileAPI().list_devices()`) to get the bound devices, with each device's
-   `thirdPartyDevId`, `prodId`, category, online state, and room/name.
+   `thirdPartyDevId`, `devName`, and `devInfo` (`sn` / `model` / `manu` /
+   `prodId`), plus a `services` list of `{st, sid}` capability identifiers.
 2. **Resolve the target device.**
    - If multiple devices match the user's wording (e.g. two range hoods), do
-     not guess. List the candidates with their room/name and ask the user to
-     choose one.
-   - If the target device is offline, report that and do not send a command.
+     not guess. List the candidates by `devName` + `thirdPartyDevId` +
+     `devInfo.model` and ask the user to choose one.
+   - **Online state is NOT in the discovery response.** Query
+     `DeviceSnapshot` (`... status <deviceId>`) and read `devices[].status`.
+     If the target device is offline, report that and do not send a command.
 3. **Read the thing model.** Open the category reference and locate the target
    function (`sid`). Confirm it is writable (**W** or **RW**).
 4. **Validate the value before sending.**
@@ -288,14 +292,49 @@ All controls use a single JSON object keyed by the function identifier:
 }
 ```
 
+## Device discovery: pagination and scope
+
+The AI channel is **not filtered by family or room**. Every device bound to —
+or shared with — the key's user is in scope, and discovery returns no
+`family` / `home` / `room` field. Do not promise a per-home or per-room list;
+if the user asks for one, say the channel does not expose that grouping.
+
+`DeviceDiscovery` on the server returns **only the first 50 devices** unless
+the client sends `page` / `pageSize`. `FotileAPI().discover_devices()` always
+sends them, honours `payload.total` / `payload.hasMore`, de-duplicates by
+`thirdPartyDevId`, and `get_status()` batches `DeviceSnapshot` in groups of 20.
+Use it (or `list_devices()`, which returns just the array) instead of
+hand-building a discovery request — otherwise "which devices are online"
+silently covers only the first 50.
+
+`total` is a raw database count. The server skips devices whose product model
+cannot be converted, so `len(devices)` can be smaller than `total`; paging
+cannot recover those. In that case `discover_devices()` reports
+`complete=false` and `missing=<gap>`, and the CLI `devices` prints a warning
+on stderr. **Report the gap to the user** — never present a truncated list as
+the full account. To inspect the metadata directly:
+
+```bash
+python scripts/fotile_api.py devices --meta
+```
+
+Large accounts can hold hundreds of devices (shared/test accounts especially).
+When answering "how many are online", query status for **all** returned ids,
+not a sample, and state the denominator (`X online / Y listed / Z server
+total`).
+
 ## Status queries
 
 ```bash
 # one device
 python scripts/fotile_api.py status 1145153645
-# multiple devices
+# multiple devices (any count; get_status() splits them into batches of 20)
 python scripts/fotile_api.py status 1145153645 1145153646
 ```
+
+`get_status()` de-duplicates ids and issues one `DeviceSnapshot` per batch of
+20 (`batch_size=` to override). Offline devices come back with an empty
+`services` list — report them as offline, never send them a command.
 
 ## Library usage
 
@@ -304,8 +343,9 @@ from fotile_api import FotileAPI
 
 api = FotileAPI()  # reads FOTILE_API_KEY (and optional FOTILE_API_BASE / FOTILE_CORP_ID)
 
-devices = api.list_devices()
-status = api.get_status(["1145153645"])
+devices = api.list_devices()                 # ALL devices, not just the first 50
+discovery = api.discover_devices()           # same, plus total / complete / missing
+status = api.get_status(["1145153645"])      # auto-batches large id lists
 api.control(prod_id="9d956a565f4727625e2f43ab6e0814b7",
             device_id="1156622673", sid="FanLevel", command={"FanLevel": 3})
 ```
@@ -361,7 +401,8 @@ So:
 
 ## Limits and safety
 
-- The key grants access only to the user's own bound devices.
+- The key grants access to every device bound to or shared with its user. The
+  AI channel does **not** filter by family or room.
 - **Handle the key carefully, but do not refuse to accept it.** The user may
   legitimately hand you the key in chat; store it with `login` and disclose
   the two facts listed in "First run". After storing it:

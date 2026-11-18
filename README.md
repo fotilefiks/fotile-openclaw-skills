@@ -19,7 +19,7 @@
 装上这个技能后，你可以直接对 AI 说「油烟机调到三档」「蒸烤箱 180 度预热」，不用打开任何 App。
 
 - **一个 Key 就够**：在方太小程序自助领取，长期有效，随时可撤销
-- **只碰你自己的设备**：Key 绑定你的账号，看不到也控制不了别人的设备
+- **只碰该 Key 账号可见的设备**：含绑定给你、以及被授权共享给你的设备（AI 通道不按家庭 / 房间过滤），看不到也控制不了别人的设备
 - **不碰局域网**：全程云端 HTTPS，不需要同一 WiFi、不需要设备密钥、不改固件
 - **不碰危险操作**：解绑、配网、OTA、账号管理都不在开放范围内
 
@@ -56,7 +56,7 @@
 
 ```text
 你：我有哪些方太设备？
-AI：（列出设备名、品类、在线状态）
+AI：（列出设备名、型号、deviceId；设备列表不含在线状态与房间信息）
 
 你：油烟机调到三档
 AI：（校验物模型 → 下发 → 回读确认 → 告知结果）
@@ -103,7 +103,7 @@ workspace/skills/     或   ~/.agents/skills/     或   ~/.openclaw/skills/
     └── references/
 ```
 
-然后用自然语言说话即可。若要以 Python 客户端 / CLI 方式使用，先装依赖：
+然后用自然语言说话即可。若要以 Python 客户端 / CLI 方式使用，**无需安装任何第三方依赖**：脚本优先使用 `requests`，未安装时自动回退到 Python 标准库 `urllib`。如需启用 `requests`（可选）：
 
 ```bash
 pip install -r fotile-cloud-control/scripts/requirements.txt
@@ -113,7 +113,9 @@ pip install -r fotile-cloud-control/scripts/requirements.txt
 from fotile_api import FotileAPI
 
 api = FotileAPI()                 # 自动查找 Key
-devices = api.list_devices()
+devices = api.list_devices()      # 全量设备：显式分页，不受默认 50 台截断影响
+meta = api.discover_devices()     # 同上，另含 total / complete / missing 元信息
+status = api.get_status(["<deviceId>"])  # 自动分批查询状态（默认每批 20 台）
 api.control(prod_id="<prodId>", device_id="<deviceId>",
             sid="FanLevel", command={"FanLevel": 3})
 ```
@@ -194,9 +196,13 @@ fotile-openclaw-skills/
 
 | namespace         | 作用       | 关键 payload                                              |
 | ----------------- | -------- | ------------------------------------------------------- |
-| `DeviceDiscovery` | 查询绑定设备列表 | `{}`                                                    |
+| `DeviceDiscovery` | 查询绑定设备列表 | `{ "page": 1, "pageSize": 1000 }`                      |
 | `DeviceSnapshot`  | 查询设备当前状态 | `{ "thirdPartyDevIds": [...] }`                         |
 | `DeviceCommand`   | 下发控制指令   | `{ "command": { prodId, thirdPartyDevId, sid, data } }` |
+
+**分页（重要）**：`DeviceDiscovery` 不传 `page` / `pageSize` 时，服务端**只返回默认首页 50 台**，即使账号下有几百台。响应会带 `payload.total` 与 `payload.hasMore`；客户端必须显式传分页参数、按 `hasMore` 继续拉取，并按 `thirdPartyDevId` 跨页去重（服务端分页 SQL 无稳定排序）。`total` 是数据库原始计数，物模型转换失败的设备会被服务端跳过、翻页也补不回来，因此 `devices` 实际条数可能少于 `total`——这种情况要如实告知用户，不能把截断结果当成全量。
+
+`SKILL.md` 的 `discover_devices()` 已实现上述逻辑；CLI 用 `python scripts/fotile_api.py devices --meta` 查看 `total` / `complete` / `missing`。**在线状态不在此响应中**，需另调 `DeviceSnapshot` 读 `devices[].status`；响应也不含家庭 / 房间字段，AI 通道不按家庭过滤，账号下被授权共享的设备同样在范围内。
 
 响应恒为两层信封：
 
@@ -235,8 +241,8 @@ CLI 会把错误码翻译成人话（`hint` 字段），并自动对 `42901` 做
 
 ## 安全机制
 
-- **只碰你自己的设备**：Key 绑定你的账号，服务端逐个校验设备归属，越权请求返回 `40302`
-- **匹配到多个设备时绝不猜**：智能体列出房间/名称请你选
+- **只碰该 Key 账号可见的设备**：含绑定给你、以及被家庭管理员授权共享给你的设备（AI 通道不按家庭 / 房间过滤）；服务端逐个校验设备归属，越权请求返回 `40302`
+- **匹配到多个设备时绝不猜**：智能体列出设备名 + deviceId + 型号请你选（设备列表不含房间字段）
 - **设备离线只报告**：不盲目下发、不排队
 - **下发前按物模型校验**：枚举值、min/max/step 严格检查，绝不写只读字段
 - **下发后回读确认**：状态真的变了才告诉你成功
@@ -246,7 +252,7 @@ CLI 会把错误码翻译成人话（`hint` 字段），并自动对 `42901` 做
 
 ## 常见问题
 
-**Q：Key 会不会泄露我的隐私？** 只能访问你本人账号下已绑定的设备，且仅限查询状态与下发控制指令。读不到你的账号信息、家庭成员、其他设备。详见[隐私与数据](#隐私与数据)。
+**Q：Key 会不会泄露我的隐私？** 只能访问该 Key 账号可见的设备（含被授权共享给你的），且仅限查询状态与下发控制指令。读不到你的账号信息、家庭成员 / 家庭分组、其他设备。详见[隐私与数据](#隐私与数据)。
 
 **Q：一个 Key 能配几个个人 AI Agent？** 不限个数，但**共用同一枚 Key 的助手会共享配额**。撤销该 Key 时它们会同时失效。单个账号最多同时持有 5 枚有效 Key。
 
@@ -320,8 +326,9 @@ Install the skill and just talk to your agent: "set the range hood to level 3",
 
 - **One key, obtained by you** — self-service from the FOTILE mini-program,
   long-lived, revocable at any time
-- **Only your devices** — the key is bound to your account; you cannot see or
-  control anyone else's appliances
+- **Your devices only** — bound to or shared with the key's account (the AI
+  channel does not filter by family or room); you cannot see or control
+  anyone else's appliances
 - **No LAN access** — plain cloud HTTPS. No same-Wi-Fi requirement, no device
   secret, no firmware change
 - **Nothing destructive** — unbinding, Wi-Fi provisioning, OTA and account
@@ -371,7 +378,7 @@ For every category, readable fields, writable functions, enums and ranges live i
 
 ```text
 You: List my FOTILE devices.
-AI:  (lists names, categories, online state)
+AI:  (lists names, models and device ids; no online state or room here)
 
 You: Set the range hood to level 3.
 AI:  (validates against the thing model → sends → reads back → reports)
@@ -424,8 +431,9 @@ workspace/skills/     or   ~/.agents/skills/     or   ~/.openclaw/skills/
     └── references/
 ```
 
-Then just talk to your agent. To use the Python client / CLI instead, install
-the dependencies first:
+Then just talk to your agent. The Python client / CLI has **no mandatory
+third-party dependency**: it uses `requests` when available and falls back to
+the standard library `urllib` otherwise. Installing `requests` is optional:
 
 ```bash
 pip install -r fotile-cloud-control/scripts/requirements.txt
@@ -435,7 +443,9 @@ pip install -r fotile-cloud-control/scripts/requirements.txt
 from fotile_api import FotileAPI
 
 api = FotileAPI()                 # finds the key automatically
-devices = api.list_devices()
+devices = api.list_devices()      # ALL devices: explicit paging, no 50-device cap
+meta = api.discover_devices()     # same, plus total / complete / missing metadata
+status = api.get_status(["<deviceId>"])  # auto-batches status queries (20 per call)
 api.control(prod_id="<prodId>", device_id="<deviceId>",
             sid="FanLevel", command={"FanLevel": 3})
 ```
@@ -528,9 +538,25 @@ operation:
 
 | Namespace | Purpose | Key payload |
 |---|---|---|
-| `DeviceDiscovery` | List bound devices | `{}` |
+| `DeviceDiscovery` | List bound devices | `{ "page": 1, "pageSize": 1000 }` |
 | `DeviceSnapshot` | Query current status | `{ "thirdPartyDevIds": [...] }` |
 | `DeviceCommand` | Send a command | `{ "command": { prodId, thirdPartyDevId, sid, data } }` |
+
+**Paging matters**: without `page` / `pageSize`, `DeviceDiscovery` returns
+**only the first 50 devices** even when the account has hundreds. The response
+carries `payload.total` and `payload.hasMore`; clients must send paging
+parameters explicitly, keep fetching while `hasMore` is true, and de-duplicate
+by `thirdPartyDevId` across pages (the server's paged SQL has no stable
+ordering). `total` is a raw database count: devices whose thing model cannot be
+converted are skipped by the server and no page can recover them, so
+`len(devices)` may be smaller than `total`. Report that gap honestly instead of
+presenting a truncated list as the full account.
+
+`discover_devices()` in `SKILL.md` implements this; inspect metadata with
+`python scripts/fotile_api.py devices --meta` (`total` / `complete` / `missing`).
+**Online state is not in this response** — query `DeviceSnapshot` and read
+`devices[].status`. There is no family / room field either: the AI channel does
+not filter by home, and devices shared with the key's user are in scope.
 
 Responses always use a two-level envelope:
 
@@ -573,8 +599,8 @@ exponentially on `42901`.
 
 ## Safety
 
-- **Your devices only** — the key is bound to your account; the server verifies
-  ownership of every device id and returns `40302` on any mismatch
+- **Your devices only** — bound to or shared with the key's account; the server
+  verifies ownership of every device id and returns `40302` on any mismatch
 - **Never guesses** — multiple matching devices are listed for you to choose
 - **Offline means report-only** — no blind commands, no queuing
 - **Validated before sending** — enums and min/max/step are checked against the
@@ -591,9 +617,9 @@ exponentially on `42901`.
 ## FAQ
 
 **Does the key leak my privacy?**
-It reaches only devices already bound to your own account, and only for status
-reads and control commands. It cannot read account details, family members, or
-other appliances. See [Privacy](#privacy).
+It reaches only devices bound to or shared with the key's account, and only
+for status reads and control commands. It cannot read account details, family
+members or family groupings, or other appliances. See [Privacy](#privacy).
 
 **How many agents can share one key?**
 Any number, but agents sharing a key also share its rate limit. Revoking the key
